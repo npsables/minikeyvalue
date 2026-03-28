@@ -30,6 +30,7 @@ type App struct {
 	protect    bool
 	md5sum     bool
 	voltimeout time.Duration
+	expiry     int
 }
 
 func (a *App) UnlockKey(key []byte) {
@@ -77,6 +78,7 @@ func main() {
 	verbose := flag.Bool("v", false, "Verbose output")
 	md5sum := flag.Bool("md5sum", true, "Calculate and store MD5 checksum of values")
 	voltimeout := flag.Duration("voltimeout", 1*time.Second, "Volume servers must respond to GET/HEAD requests in this amount of time or they are considered down, as duration")
+	expiry := flag.Int("expiry", 0, "Delete files older than this many days (0 = disabled)")
 	flag.Parse()
 
 	volumes := strings.Split(*pvolumes, ",")
@@ -119,9 +121,13 @@ func main() {
 		protect:    *protect,
 		md5sum:     *md5sum,
 		voltimeout: *voltimeout,
+		expiry:     *expiry,
 	}
 
 	if command == "server" {
+		if a.expiry > 0 {
+			go a.PurgeLoop()
+		}
 		http.ListenAndServe(fmt.Sprintf(":%d", *port), &a)
 	} else if command == "rebuild" {
 		a.Rebuild()

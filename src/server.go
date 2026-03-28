@@ -49,6 +49,15 @@ func (a *App) QueryHandler(key []byte, w http.ResponseWriter, r *http.Request) {
 	// operation is first query parameter (e.g. ?list&limit=10)
 	operation := strings.Split(r.URL.RawQuery, "&")[0]
 	switch operation {
+	case "purge":
+		if a.expiry == 0 {
+			w.WriteHeader(400)
+			w.Write([]byte("expiry not set"))
+			return
+		}
+		a.purge()
+		w.WriteHeader(204)
+		return
 	case "list", "unlinked":
 		start := r.URL.Query().Get("start")
 		limit := 0
@@ -183,6 +192,7 @@ func (a *App) WriteToReplicas(key []byte, value io.Reader, valuelen int64) int {
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*") // don't try this at home kids
 	key := []byte(r.URL.Path)
 	lkey := []byte(r.URL.Path + r.URL.Query().Get("partNumber"))
 

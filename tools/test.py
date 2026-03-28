@@ -9,6 +9,8 @@ from urllib.parse import quote_plus
 import time
 import timeit
 import logging
+import base64
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 logging.basicConfig(format='%(name)s %(levelname)s %(message)s')
@@ -193,6 +195,81 @@ class TestMiniKeyValue(unittest.TestCase):
 
       r = requests.head(key, allow_redirects=False)
       self.assertEqual(r.headers['Content-Md5'], hashlib.md5(key).hexdigest())
+
+  def _key_to_volume_path(self, key, volume_root):
+    """Resolve the physical path of a key on a local volume root."""
+    raw = key if isinstance(key, bytes) else key.encode()
+    # strip http://localhost:3000 prefix to get the key path
+    path = raw.split(b"localhost:3000", 1)[-1]
+    import hashlib as hl, base64 as b64
+    mkey = hl.md5(path).digest()
+    b64key = b64.b64encode(path).decode()
+    return os.path.join(volume_root, "%02x" % mkey[0], "%02x" % mkey[1], b64key)
+
+  def _backdate_all_replicas(self, key, past):
+    """Backdate the mtime of key on every replica volume to `past` (unix timestamp)."""
+    import hashlib as hl, base64 as b64
+    r = requests.head(key, allow_redirects=False)
+    self.assertEqual(r.status_code, 302)
+    kvols = r.headers.get("Key-Volumes", "")
+    raw = key if isinstance(key, bytes) else key.encode()
+    path = raw.split(b"localhost:3000", 1)[-1]
+    mkey = hl.md5(path).digest()
+    b64key = b64.b64encode(path).decode()
+    kpath = "%02x/%02x/%s" % (mkey[0], mkey[1], b64key)
+    for vol in kvols.split(","):
+        # vol is e.g. "localhost:3005/sv06" — map port to /tmp/volumeN/
+        host_port, sv = vol.split("/", 1)
+        port = int(host_port.split(":")[1])
+        file_path = "/tmp/volume%d/%s/%s" % (port - 3000, sv, kpath)
+        if os.path.exists(file_path):
+            os.utime(file_path, (past, past))
+
+  def test_purge_expiry(self):
+    """PUT a file, backdate its mtime on disk, trigger ?purge, verify it's gone."""
+    key = self.get_fresh_key()
+    r = requests.put(key, data=b"expire me")
+    self.assertEqual(r.status_code, 201)
+
+    # backdate mtime on all replicas to 10 days ago so expiry=5 will catch it
+    past = time.time() - 10 * 86400
+    self._backdate_all_replicas(key, past)
+
+    # trigger purge via master (runs synchronously, 204 = done)
+    r = requests.get("http://localhost:3000/?purge")
+    self.assertEqual(r.status_code, 204)
+
+    # file should now be gone
+    r = requests.get(key)
+    self.assertEqual(r.status_code, 404)
+
+  def test_purge_concurrent_put(self):
+    """Concurrent PUT during purge must not lose the new file."""
+    # PUT an old file and backdate all its replicas before purge starts
+    old_key = self.get_fresh_key()
+    r = requests.put(old_key, data=b"old data")
+    self.assertEqual(r.status_code, 201)
+
+    past = time.time() - 10 * 86400
+    self._backdate_all_replicas(old_key, past)
+
+    # fire purge and a concurrent new PUT at the same time
+    new_key = self.get_fresh_key()
+    with ThreadPoolExecutor(max_workers=2) as ex:
+      purge_future = ex.submit(requests.get, "http://localhost:3000/?purge")
+      put_future   = ex.submit(requests.put, new_key, b"new data")
+
+    self.assertEqual(purge_future.result().status_code, 204)
+    self.assertEqual(put_future.result().status_code, 201)
+
+    # old file must be gone
+    r = requests.get(old_key)
+    self.assertEqual(r.status_code, 404)
+
+    # new file must still be alive
+    r = requests.get(new_key)
+    self.assertEqual(r.status_code, 200)
+    self.assertEqual(r.content, b"new data")
 
 if __name__ == '__main__':
   # wait for servers
